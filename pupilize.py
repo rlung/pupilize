@@ -93,8 +93,9 @@ def circle2roi(circles):
     return np.array([tl, tr, br, bl, tl])
 
 
-def manage_data(data, mpool=None, sample_period=200, key='cam/frames'):
+def manage_data(data, mpool=None, sample_period=200, key='cam/frames', time_limit=300000):
     global df
+    epoch_dict = {'1': 'base', '2': 'ctrl', '3': 'stim'}
 
     print("Analyzing {}...".format(os.path.basename(data)))
 
@@ -103,20 +104,47 @@ def manage_data(data, mpool=None, sample_period=200, key='cam/frames'):
 
     hf = h5.File(data, 'r')
     pupil_frames = hf[key]
-    pupil_timestamps = hf[os.path.basename(key) + '/timestamps']
+    pupil_timestamps = hf[os.path.dirname(key) + '/timestamps']
 
     # Calculate pupil diameter
     pfunc = partial(pupilize, threshold=127, kernel=np.ones((7, 7)))
-    boxes, _ = zip(*mpool.map(pfunc, pupil_frames))
+    if mpool:
+        boxes, _ = zip(*mpool.map(pfunc, pupil_frames))
+    else:
+        boxes, _ = zip(*map(pfunc, pupil_frames))
     pupil_diam = [w for _, _, w, _ in boxes]
 
     # Resample data
-    ts_new = np.arange(0, int(pupil_timestamps[-1]), sample_period)
-    pupil_resampled = custom.resample(pupil_diam, pupil_timestamps, ts_new)
+    # ts_max = min(time_limit, int(pupil_timestamps[-1]))
+    # ts_new = np.arange(0, ts_max, sample_period)
+    ts_new = np.array(df.index.levels[1])
+    pupil_resampled = custom.resample(pupil_diam, pupil_timestamps, ts_new, method='mean')
+
+    behav = hf['behavior']
+    trials = custom.resample(np.ones(behav['trials'].shape), behav['trials'], ts_new, method='or')
+    rail_home = custom.resample(np.ones(behav['rail_home'].shape), behav['rail_home'], ts_new, method='or')
+    rail_leave = custom.resample(np.ones(behav['rail_leave'].shape), behav['rail_leave'], ts_new, method='or')
+    track = custom.resample(behav['track'][1], behav['track'][0], ts_new, method='sum')
 
     # Save data
-    col_name = '{}_{}_{}_{}'.format(animal_id, exp_day, stim, epoch)
-    df = df.assign(**{col_name: pupil_resampled})
+    col_name = (animal_id, '_'.join([exp_day, stim]))
+    df.set_value(epoch_dict[epoch], col_name + ('pupil', ), pupil_resampled)
+    df.set_value(epoch_dict[epoch], col_name + ('trials', ), trials)
+    df.set_value(epoch_dict[epoch], col_name + ('rail_home', ), rail_home)
+    df.set_value(epoch_dict[epoch], col_name + ('rail_leave', ), rail_leave)
+    df.set_value(epoch_dict[epoch], col_name + ('track', ), track)
+
+    # df.set_value(ix0, col_name, pupil_resampled)
+    # if df is None:
+    #     series = {col_name: pupil_resampled}
+    #     df = pd.DataFrame(
+    #         series,
+    #         index=pd.MultiIndex.from_tuples(
+    #             zip([epoch] * len(ts_new), ts_new)
+    #         )
+    #     )
+    # else:
+    #     df[col_name, epoch] = pupil_resampled
 
     # save_file = '{}_{}_{}.txt'.format(animal_id, exp_day, epoch)
     # np.savetxt(save_file, pupil_diam)
@@ -145,10 +173,6 @@ def main():
         "-n", "--number-of-cores", default=1,
         help="Number of cores to use for parallel processing"
     )
-    # parser.add_argument(
-    #     "-a", "--append", default='false', action='store_true',
-    #     help="Appends data to HDF5 file"
-    # )
     parser.add_argument(
         "-o", "--output", default=None,
         help="Output HDF5 file for data"
@@ -158,9 +182,26 @@ def main():
     # Setup multiprocessing pool
     p = multi.Pool(processes=int(opts.number_of_cores))
 
-    # Process file(s)
+    # Create DataFrame
+    time_limit = 300000
+    bin_size = 200
+    ts = np.arange(0, time_limit, bin_size)
+    
+    nbins = len(ts)
     global df
-    df = pd.DataFrame()
+    df = pd.DataFrame(
+        index=pd.MultiIndex.from_tuples(
+            zip(['base'] * nbins, ts) + zip(['ctrl'] * nbins, ts) + zip(['stim'] * nbins, ts),
+            names=['epoch', 'time']
+        ),
+        columns=pd.MultiIndex(
+            levels=[[], [], []],
+            labels=[[], [], []],
+            names=['animal', 'experiment', 'variable']
+        )
+    )
+
+    # Process file(s)
     if os.path.isdir(opts.data):
         files = glob.glob(os.path.join(opts.data, '*.h5'))
 
@@ -173,11 +214,15 @@ def main():
     else:
         raise IOError("Invalid input for data")
 
-    # Save data
+    # Save DataFrame
     # np.savetxt("pupils.txt", pupils)
+    if opts.output:
+        outfile = opts.output
+    else:
+        outfile = 'pupils.h5'
+
     df = df.sort_index(axis=1)
-    df.assign(time=np.arange(len(df)) * 200).set_index('time')
-    df_h5 = pd.HDFStore('pupils.h5')
+    df_h5 = pd.HDFStore(outfile)
     df_h5['pupils'] = df
     df_h5.close()
 
