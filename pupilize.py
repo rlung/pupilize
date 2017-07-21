@@ -14,7 +14,7 @@ import custom
 import pdb
 
 
-def pupilize(im, threshold=127, invert=True,
+def pupilize(im, threshold=127, invert=False,
              kernel=np.ones((7, 7)), morph_iter=4):
     '''
     Measures pupil.
@@ -71,6 +71,77 @@ def pupilize(im, threshold=127, invert=True,
     # return hough
 
 
+def pupil_trials(df, bin_size=200, pre=-16000, post=21000):
+
+    sall = slice(None)
+    pre_bins = pre / bin_size
+    post_bins = post / bin_size
+
+    # Find unique animals from certain pattern in experiment names
+    # subjects = np.unique([x.split('_')[0] for x in df.columns.levels[0]])
+
+    subjs = []          # Initialize list of dataframes for each subject
+    subj_names = []     # Initialize list of names for each subject (corresponding to `subjs`)
+
+    for subj in df.columns.levels[0]:
+    #     experiments_w_subj = [x for x in df.columns.levels[0] if subj in x]
+        
+        exps = []      # Initialize list of dataframes for each type of experiment (control, TMT...)
+        exp_names = []
+
+        for exp in df[subj].columns.levels[0]:
+            # df[exp]
+            epochs = []       # Initilize list of dataframes for each epoch in experiment (water exposure, TMT...)
+            epoch_names = []
+
+            for epoch in df.index.levels[0]:
+                df_epoch = df.loc[epoch, (subj, exp, sall)]
+                num_levels = len(df_epoch.columns.levels)
+                if num_levels > 1:
+                    df_epoch.columns = df_epoch.columns.droplevel(range(num_levels-1))
+                trial_loc = df_epoch[df_epoch['trials'] == 1].index
+                trial_window = zip(trial_loc + pre, trial_loc + post - bin_size)
+                
+                trials = []      # Initialize list of dataframes for each trial
+                trial_names = []
+
+                for n, x in enumerate(trial_window):
+                    # Get subset of dataframe for current trial window
+                    trial = df_epoch.loc[slice(*x), :]
+
+                    # Define new index (based on time relative to trial)
+                    # Need to define index relative to current index in case of missing data.
+                    index_vals = np.arange(pre, post, bin_size)
+                    trial_index = pd.DataFrame({
+                        'trial_time': index_vals,
+                        'time': np.linspace(*(x + (len(index_vals), )), dtype=int)
+                    })
+                    trial_index = trial_index.set_index('time')
+
+                    # Add and set new index
+                    trial = pd.concat([trial, trial_index], axis=1)
+                    trial = trial.reset_index(level='time')
+                    trial = trial.set_index('trial_time')
+                    trials.append(trial)
+                    trial_names.append(n)
+
+                trials_in_epoch = pd.concat(trials, keys=trial_names, names=['trial'], axis=1)
+                epochs.append(trials_in_epoch)
+                epoch_names.append(epoch)
+
+            epochs_in_exp = pd.concat(epochs, keys=epoch_names, names=['epoch'], axis=0)
+            exps.append(epochs_in_exp)
+            exp_names.append(exp.split('_')[-1])
+
+        exps_for_subj = pd.concat(exps, keys=exp_names, names=['experiment', 'trial', 'variable'], axis=1)
+        subjs.append(exps_for_subj)
+        subj_names.append(subj)
+
+    df_trials = pd.concat(subjs, keys=subj_names, names=['subject', 'experiment', 'trial', 'variable'], axis=1)
+    df_trials = df_trials.sort_index(axis=1, level=['subject', 'experiment', 'trial', 'variable'])  # Allows for indexing (killed myself over this)
+
+    return df_trials
+
 def box2roi(box):
     x, y, w, h = box
     tl = [x, y]
@@ -99,35 +170,39 @@ def manage_data(data, mpool=None, sample_period=200, key='cam/frames', time_limi
 
     print("Analyzing {}...".format(os.path.basename(data)))
 
-    animal_id, exp_day, stim, date, epoch = os.path.splitext(
+    _, animal_id, exp_day, plane, epoch = os.path.splitext(
         os.path.basename(data))[0].split('_')
 
-    hf = h5.File(data, 'r')
-    pupil_frames = hf[key]
-    pupil_timestamps = hf[os.path.dirname(key) + '/timestamps']
+    with h5.File(data, 'r') as hf:
+        pupil_frames = hf[key]
+        pupil_timestamps = hf[os.path.dirname(key) + '/timestamps']
 
-    # Calculate pupil diameter
-    pfunc = partial(pupilize, threshold=127, kernel=np.ones((7, 7)))
-    if mpool:
-        boxes, _ = zip(*mpool.map(pfunc, pupil_frames))
-    else:
-        boxes, _ = zip(*map(pfunc, pupil_frames))
-    pupil_diam = [w for _, _, w, _ in boxes]
+        # Calculate pupil diameter
+        pfunc = partial(pupilize, threshold=127, kernel=np.ones((7, 7)))
+        if mpool:
+            boxes, _ = zip(*mpool.map(pfunc, pupil_frames))
+        else:
+            boxes, _ = zip(*map(pfunc, pupil_frames))
+        pupil_diam = [w for _, _, w, _ in boxes]
 
-    # Resample data
-    # ts_max = min(time_limit, int(pupil_timestamps[-1]))
-    # ts_new = np.arange(0, ts_max, sample_period)
-    ts_new = np.array(df.index.levels[1])
-    pupil_resampled = custom.resample(pupil_diam, pupil_timestamps, ts_new, method='mean')
+        # Resample data
+        # ts_max = min(time_limit, int(pupil_timestamps[-1]))
+        # ts_new = np.arange(0, ts_max, sample_period)
+        ts_new = np.array(df.index.levels[1])
+        pupil_resampled = custom.resample(pupil_diam, pupil_timestamps, ts_new, method=np.mean)
 
-    behav = hf['behavior']
-    trials = custom.resample(np.ones(behav['trials'].shape), behav['trials'], ts_new, method='or')
-    rail_home = custom.resample(np.ones(behav['rail_home'].shape), behav['rail_home'], ts_new, method='or')
-    rail_leave = custom.resample(np.ones(behav['rail_leave'].shape), behav['rail_leave'], ts_new, method='or')
-    track = custom.resample(behav['track'][1], behav['track'][0], ts_new, method='sum')
+        behav = hf['behavior']
+        trials = custom.resample(
+            np.ones(behav['trials'].shape), behav['trials'], ts_new, method=np.any)
+        rail_home = custom.resample(
+            np.ones(behav['rail_home'].shape), behav['rail_home'], ts_new, method=np.any)
+        rail_leave = custom.resample(
+            np.ones(behav['rail_leave'].shape), behav['rail_leave'], ts_new, method=np.any)
+        track = custom.resample(
+            behav['track'][1], behav['track'][0], ts_new, method=np.sum)
 
     # Save data
-    col_name = (animal_id, '_'.join([exp_day, stim]))
+    col_name = (animal_id, exp_day, plane)
     df.set_value(epoch_dict[epoch], col_name + ('pupil', ), pupil_resampled)
     df.set_value(epoch_dict[epoch], col_name + ('trials', ), trials)
     df.set_value(epoch_dict[epoch], col_name + ('rail_home', ), rail_home)
@@ -159,7 +234,8 @@ def main():
         formatter_class=RawTextHelpFormatter
     )
     parser.add_argument(
-        "data", help="HDF5 file (or directory containing files) with pupil data"
+        "data",
+        help="HDF5 file (or directory containing files) with pupil data"
     )
     parser.add_argument(
         "-k", "--key", default='cam/frames',
@@ -195,9 +271,9 @@ def main():
             names=['epoch', 'time']
         ),
         columns=pd.MultiIndex(
-            levels=[[], [], []],
-            labels=[[], [], []],
-            names=['animal', 'experiment', 'variable']
+            levels=[[], [], [], []],
+            labels=[[], [], [], []],
+            names=['animal', 'experiment', 'plane', 'variable']
         )
     )
 
@@ -222,9 +298,8 @@ def main():
         outfile = 'pupils.h5'
 
     df = df.sort_index(axis=1)
-    df_h5 = pd.HDFStore(outfile)
-    df_h5['pupils'] = df
-    df_h5.close()
+    with pd.HDFStore(outfile) as df_h5:
+    	df_h5['pupils'] = df
 
     print("All done")
 
