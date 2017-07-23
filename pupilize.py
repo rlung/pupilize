@@ -5,6 +5,8 @@ import h5py as h5
 import pandas as pd
 import cv2
 import os
+from time import strftime
+from datetime import datetime
 import glob
 import multiprocessing as multi
 from functools import partial
@@ -164,7 +166,7 @@ def circle2roi(circles):
     return np.array([tl, tr, br, bl, tl])
 
 
-def manage_data(data, mpool=None, sample_period=200, key='cam/frames', time_limit=300000):
+def manage_data(data, n_cores=1, threshold=127, sample_period=200, key='cam/frames', time_limit=300000):
     global df
     epoch_dict = {'1': 'base', '2': 'ctrl', '3': 'stim'}
 
@@ -179,8 +181,9 @@ def manage_data(data, mpool=None, sample_period=200, key='cam/frames', time_limi
 
         # Calculate pupil diameter
         pfunc = partial(pupilize, threshold=127, kernel=np.ones((7, 7)))
-        if mpool:
-            boxes, _ = zip(*mpool.map(pfunc, pupil_frames))
+        if n_cores > 1:
+            p = multi.Pool(processes=n_cores)
+            boxes, _ = zip(*p.map(pfunc, pupil_frames))
         else:
             boxes, _ = zip(*map(pfunc, pupil_frames))
         pupil_diam = [w for _, _, w, _ in boxes]
@@ -246,7 +249,7 @@ def main():
         help="Threshold for creating binary pupil image"
     )
     parser.add_argument(
-        "-n", "--number-of-cores", default=1,
+        "-n", "--number-of-cores", default=None,
         help="Number of cores to use for parallel processing"
     )
     parser.add_argument(
@@ -254,9 +257,7 @@ def main():
         help="Output HDF5 file for data"
     )
     opts = parser.parse_args()
-
-    # Setup multiprocessing pool
-    p = multi.Pool(processes=int(opts.number_of_cores))
+    thresh = int(opts.threshold)
 
     # Create DataFrame
     time_limit = 300000
@@ -283,10 +284,10 @@ def main():
 
         # pupils = np.column_stack([manage_data(f, mpool=p, df=df) for f in files])
 
-        pfn = partial(manage_data, mpool=p, key=opts.key)
+        pfn = partial(manage_data, n_cores=int(opts.number_of_cores), threshold=thresh, key=opts.key)
         map(pfn, files)
     elif os.path.isfile(opts.data):
-        manage_data(data, mpool=p, key=opts.key)
+        manage_data(data, n_cores=int(opts.number_of_cores), threshold=thresh, key=opts.key)
     else:
         raise IOError("Invalid input for data")
 
@@ -298,8 +299,10 @@ def main():
         outfile = 'pupils.h5'
 
     df = df.sort_index(axis=1)
-    with pd.HDFStore(outfile) as df_h5:
-    	df_h5['pupils'] = df
+    with pd.HDFStore(outfile) as hf:
+    	hf['pupils'] = df
+        hf.get_storer('pupils').attrs['threshold'] = thresh
+        hf.get_storer('pupils').attrs['timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     print("All done")
 
