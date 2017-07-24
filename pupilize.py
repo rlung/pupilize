@@ -73,76 +73,58 @@ def pupilize(im, threshold=127, invert=False,
     # return hough
 
 
-def pupil_trials(df, bin_size=200, pre=-16000, post=21000):
+def pupil_trials(df, level=-1, bin_size=200, pre=-16000, post=21000):
 
-    sall = slice(None)
     pre_bins = pre / bin_size
     post_bins = post / bin_size
 
     # Find unique animals from certain pattern in experiment names
     # subjects = np.unique([x.split('_')[0] for x in df.columns.levels[0]])
 
-    subjs = []          # Initialize list of dataframes for each subject
-    subj_names = []     # Initialize list of names for each subject (corresponding to `subjs`)
+    exps = df.xs('trials', axis=1, level=-1).columns
+    exps_dict = {}
 
-    for subj in df.columns.levels[0]:
-    #     experiments_w_subj = [x for x in df.columns.levels[0] if subj in x]
+    # Iterate over experiments (different planes are separate experiments)
+    for exp in exps:
+        epochs_dict = {}
         
-        exps = []      # Initialize list of dataframes for each type of experiment (control, TMT...)
-        exp_names = []
+        # Iterate over epochs
+        for epoch in df[exp].index.levels[0]:
+            df_epoch = df.loc[epoch, exp]
+            trial_starts = df_epoch[df_epoch['trials'] == 1].index
+            trial_window = zip(trial_starts + pre, trial_loc + post - bin_size)
+            trials_dict = {}      # Initialize list of dataframes for each trial
 
-        for exp in df[subj].columns.levels[0]:
-            # df[exp]
-            epochs = []       # Initilize list of dataframes for each epoch in experiment (water exposure, TMT...)
-            epoch_names = []
+            # Iterate over trials
+            for n, x in enumerate(trial_window):
+                # Get subset of dataframe for current trial window
+                trial = df_epoch.loc[slice(*x), :]
 
-            for epoch in df.index.levels[0]:
-                df_epoch = df.loc[epoch, (subj, exp, sall)]
-                num_levels = len(df_epoch.columns.levels)
-                if num_levels > 1:
-                    df_epoch.columns = df_epoch.columns.droplevel(range(num_levels-1))
-                trial_loc = df_epoch[df_epoch['trials'] == 1].index
-                trial_window = zip(trial_loc + pre, trial_loc + post - bin_size)
-                
-                trials = []      # Initialize list of dataframes for each trial
-                trial_names = []
+                # Define new index (based on time relative to trial)
+                # Need to define index relative to current index in case of missing data.
+                index_vals = np.arange(pre, post, bin_size)
+                trial_index = pd.DataFrame({
+                    'trial_time': index_vals,
+                    'time': np.linspace(*(x + (len(index_vals), )), dtype=int)
+                })
+                trial_index = trial_index.set_index('time')
 
-                for n, x in enumerate(trial_window):
-                    # Get subset of dataframe for current trial window
-                    trial = df_epoch.loc[slice(*x), :]
+                # Add and set new index
+                trial = pd.concat([trial, trial_index], axis=1)
+                trial = trial.reset_index(level='time')
+                trial = trial.set_index('trial_time')
+                trials_dict[n] = trial
 
-                    # Define new index (based on time relative to trial)
-                    # Need to define index relative to current index in case of missing data.
-                    index_vals = np.arange(pre, post, bin_size)
-                    trial_index = pd.DataFrame({
-                        'trial_time': index_vals,
-                        'time': np.linspace(*(x + (len(index_vals), )), dtype=int)
-                    })
-                    trial_index = trial_index.set_index('time')
+            trials_df = pd.concat(trials_dict, names=['trial'], axis=1)
+            epochs_dict[epoch] = trials_df
+            
+        epochs_df = pd.concat(epochs_dict, names=['epoch'], axis=0)
+        exps_dict[exp] = epochs_df
+        
+    exps_df = pd.concat(exps_dict, names=exps.names, axis=1)
+    exps_df = exps_df.sort_index(axis=1)  # Allows for indexing (killed myself over this)
 
-                    # Add and set new index
-                    trial = pd.concat([trial, trial_index], axis=1)
-                    trial = trial.reset_index(level='time')
-                    trial = trial.set_index('trial_time')
-                    trials.append(trial)
-                    trial_names.append(n)
-
-                trials_in_epoch = pd.concat(trials, keys=trial_names, names=['trial'], axis=1)
-                epochs.append(trials_in_epoch)
-                epoch_names.append(epoch)
-
-            epochs_in_exp = pd.concat(epochs, keys=epoch_names, names=['epoch'], axis=0)
-            exps.append(epochs_in_exp)
-            exp_names.append(exp.split('_')[-1])
-
-        exps_for_subj = pd.concat(exps, keys=exp_names, names=['experiment', 'trial', 'variable'], axis=1)
-        subjs.append(exps_for_subj)
-        subj_names.append(subj)
-
-    df_trials = pd.concat(subjs, keys=subj_names, names=['subject', 'experiment', 'trial', 'variable'], axis=1)
-    df_trials = df_trials.sort_index(axis=1, level=['subject', 'experiment', 'trial', 'variable'])  # Allows for indexing (killed myself over this)
-
-    return df_trials
+    return exps_df
 
 def box2roi(box):
     x, y, w, h = box
@@ -274,7 +256,7 @@ def main():
         columns=pd.MultiIndex(
             levels=[[], [], [], []],
             labels=[[], [], [], []],
-            names=['animal', 'experiment', 'plane', 'variable']
+            names=['subject', 'experiment', 'plane', 'feature']
         )
     )
 
