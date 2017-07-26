@@ -5,6 +5,8 @@ import h5py as h5
 import pandas as pd
 import cv2
 import os
+from time import strftime
+from datetime import datetime
 import glob
 import multiprocessing as multi
 from functools import partial
@@ -14,7 +16,7 @@ import custom
 import pdb
 
 
-def pupilize(im, threshold=127, invert=True,
+def pupilize(im, threshold=127, invert=False,
              kernel=np.ones((7, 7)), morph_iter=4):
     '''
     Measures pupil.
@@ -71,6 +73,65 @@ def pupilize(im, threshold=127, invert=True,
     # return hough
 
 
+def pupil_trials(df, axis=1, level=-1, bin_size=200, pre=-16000, post=21000):
+
+    '''
+
+    '''
+
+    pre_bins = pre / bin_size
+    post_bins = post / bin_size
+    column_names = df.columns.names
+
+    # Find unique animals from certain pattern in experiment names
+    # subjects = np.unique([x.split('_')[0] for x in df.columns.levels[0]])
+
+    exps = df.xs('trials', axis=axis, level=level).columns
+    exps_dict = {}
+
+    # Iterate over experiments (different planes are separate experiments)
+    for exp in exps:
+        epochs_dict = {}
+
+        # Iterate over epochs
+        for epoch in df[exp].index.levels[0]:
+            df_epoch = df.loc[epoch, exp]
+            trial_starts = df_epoch[df_epoch['trials'] == 1].index
+            trial_window = zip(trial_starts + pre, trial_starts + post - bin_size)
+            trials_dict = {}      # Initialize list of dataframes for each trial
+
+            # Iterate over trials
+            for n, x in enumerate(trial_window):
+                # Get subset of dataframe for current trial window
+                trial = df_epoch.loc[slice(*x), :]
+
+                # Define new index (based on time relative to trial)
+                # Need to define index relative to current index in case of missing data.
+                index_vals = np.arange(pre, post, bin_size)
+                trial_index = pd.DataFrame({
+                    'trial_time': index_vals,
+                    'time': np.linspace(*(x + (len(index_vals), )), dtype=int)
+                })
+                trial_index = trial_index.set_index('time')
+
+                # Add and set new index
+                trial = pd.concat([trial, trial_index], axis=1)
+                trial.columns.names = [column_names[-1]]
+                trial = trial.reset_index(level='time')
+                trial = trial.set_index('trial_time')
+                trials_dict[n] = trial
+
+            trials_df = pd.concat(trials_dict, names=['trial'], axis=1)
+            epochs_dict[epoch] = trials_df
+            
+        epochs_df = pd.concat(epochs_dict, names=['epoch'], axis=0)
+        exps_dict[exp] = epochs_df
+        
+    exps_df = pd.concat(exps_dict, names=exps.names, axis=axis)
+    exps_df = exps_df.sort_index(axis=axis)  # Allows for indexing (killed myself over this)
+
+    return exps_df
+
 def box2roi(box):
     x, y, w, h = box
     tl = [x, y]
@@ -93,30 +154,64 @@ def circle2roi(circles):
     return np.array([tl, tr, br, bl, tl])
 
 
-def manage_data(data, mpool=None, sample_period=200, key='cam/frames'):
+def manage_data(data, n_cores=1, threshold=127, sample_period=200, key='cam/frames', time_limit=300000):
     global df
+    epoch_dict = {'1': 'base', '2': 'ctrl', '3': 'stim'}
 
     print("Analyzing {}...".format(os.path.basename(data)))
 
-    animal_id, exp_day, stim, date, epoch = os.path.splitext(
+    _, animal_id, exp_day, plane, epoch = os.path.splitext(
         os.path.basename(data))[0].split('_')
 
-    hf = h5.File(data, 'r')
-    pupil_frames = hf[key]
-    pupil_timestamps = hf[os.path.basename(key) + '/timestamps']
+    with h5.File(data, 'r') as hf:
+        pupil_frames = hf[key]
+        pupil_timestamps = hf[os.path.dirname(key) + '/timestamps']
 
-    # Calculate pupil diameter
-    pfunc = partial(pupilize, threshold=127, kernel=np.ones((7, 7)))
-    boxes, _ = zip(*mpool.map(pfunc, pupil_frames))
-    pupil_diam = [w for _, _, w, _ in boxes]
+        # Calculate pupil diameter
+        pfunc = partial(pupilize, threshold=127, kernel=np.ones((7, 7)))
+        if n_cores > 1:
+            p = multi.Pool(processes=n_cores)
+            boxes, _ = zip(*p.map(pfunc, pupil_frames))
+        else:
+            boxes, _ = zip(*map(pfunc, pupil_frames))
+        pupil_diam = [w for _, _, w, _ in boxes]
 
-    # Resample data
-    ts_new = np.arange(0, int(pupil_timestamps[-1]), sample_period)
-    pupil_resampled = custom.resample(pupil_diam, pupil_timestamps, ts_new)
+        # Resample data
+        # ts_max = min(time_limit, int(pupil_timestamps[-1]))
+        # ts_new = np.arange(0, ts_max, sample_period)
+        ts_new = np.array(df.index.levels[1])
+        pupil_resampled = custom.resample(pupil_diam, pupil_timestamps, ts_new, method=np.mean)
+
+        behav = hf['behavior']
+        trials = custom.resample(
+            np.ones(behav['trials'].shape), behav['trials'], ts_new, method=np.any)
+        rail_home = custom.resample(
+            np.ones(behav['rail_home'].shape), behav['rail_home'], ts_new, method=np.any)
+        rail_leave = custom.resample(
+            np.ones(behav['rail_leave'].shape), behav['rail_leave'], ts_new, method=np.any)
+        track = custom.resample(
+            behav['track'][1], behav['track'][0], ts_new, method=np.sum)
 
     # Save data
-    col_name = '{}_{}_{}_{}'.format(animal_id, exp_day, stim, epoch)
-    df = df.assign(**{col_name: pupil_resampled})
+    col_name = (animal_id, plane)
+    # pdb.set_trace()
+    df.set_value(epoch_dict[epoch], col_name + ('pupil', ), pupil_resampled)
+    df.set_value(epoch_dict[epoch], col_name + ('trials', ), trials)
+    df.set_value(epoch_dict[epoch], col_name + ('rail_home', ), rail_home)
+    df.set_value(epoch_dict[epoch], col_name + ('rail_leave', ), rail_leave)
+    df.set_value(epoch_dict[epoch], col_name + ('track', ), track)
+
+    # df.set_value(ix0, col_name, pupil_resampled)
+    # if df is None:
+    #     series = {col_name: pupil_resampled}
+    #     df = pd.DataFrame(
+    #         series,
+    #         index=pd.MultiIndex.from_tuples(
+    #             zip([epoch] * len(ts_new), ts_new)
+    #         )
+    #     )
+    # else:
+    #     df[col_name, epoch] = pupil_resampled
 
     # save_file = '{}_{}_{}.txt'.format(animal_id, exp_day, epoch)
     # np.savetxt(save_file, pupil_diam)
@@ -131,7 +226,8 @@ def main():
         formatter_class=RawTextHelpFormatter
     )
     parser.add_argument(
-        "data", help="HDF5 file (or directory containing files) with pupil data"
+        "data",
+        help="HDF5 file (or directory containing files) with pupil data"
     )
     parser.add_argument(
         "-k", "--key", default='cam/frames',
@@ -142,44 +238,64 @@ def main():
         help="Threshold for creating binary pupil image"
     )
     parser.add_argument(
-        "-n", "--number-of-cores", default=1,
+        "-n", "--number-of-cores", default=None,
         help="Number of cores to use for parallel processing"
     )
-    # parser.add_argument(
-    #     "-a", "--append", default='false', action='store_true',
-    #     help="Appends data to HDF5 file"
-    # )
     parser.add_argument(
         "-o", "--output", default=None,
         help="Output HDF5 file for data"
     )
     opts = parser.parse_args()
+    if opts.number_of_cores:
+        n_cores = int(opts.number_of_cores)
+    else:
+        n_cores = None
+    thresh = int(opts.threshold)
 
-    # Setup multiprocessing pool
-    p = multi.Pool(processes=int(opts.number_of_cores))
+    # Create DataFrame
+    time_limit = 300000
+    bin_size = 200
+    ts = np.arange(0, time_limit, bin_size)
+    
+    nbins = len(ts)
+    global df
+    df = pd.DataFrame(
+        index=pd.MultiIndex.from_tuples(
+            zip(['base'] * nbins, ts) + zip(['ctrl'] * nbins, ts) + zip(['stim'] * nbins, ts),
+            names=['epoch', 'time']
+        ),
+        columns=pd.MultiIndex(
+            levels=[[], [], []],
+            labels=[[], [], []],
+            names=['subject', 'plane', 'feature']
+        )
+    )
 
     # Process file(s)
-    global df
-    df = pd.DataFrame()
     if os.path.isdir(opts.data):
         files = glob.glob(os.path.join(opts.data, '*.h5'))
 
         # pupils = np.column_stack([manage_data(f, mpool=p, df=df) for f in files])
 
-        pfn = partial(manage_data, mpool=p, key=opts.key)
+        pfn = partial(manage_data, n_cores=n_cores, threshold=thresh, key=opts.key)
         map(pfn, files)
     elif os.path.isfile(opts.data):
-        manage_data(data, mpool=p, key=opts.key)
+        manage_data(opts.data, n_cores=n_cores, threshold=thresh, key=opts.key)
     else:
-        raise IOError("Invalid input for data")
+        raise IOError("Invalid input '{}'".format(opts.data))
 
-    # Save data
+    # Save DataFrame
     # np.savetxt("pupils.txt", pupils)
+    if opts.output:
+        outfile = opts.output
+    else:
+        outfile = 'pupils.h5'
+
     df = df.sort_index(axis=1)
-    df.assign(time=np.arange(len(df)) * 200).set_index('time')
-    df_h5 = pd.HDFStore('pupils.h5')
-    df_h5['pupils'] = df
-    df_h5.close()
+    with pd.HDFStore(outfile) as hf:
+    	hf['behav'] = df
+        hf.get_storer('behav').attrs['threshold'] = thresh
+        hf.get_storer('behav').attrs['timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     print("All done")
 
