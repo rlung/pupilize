@@ -73,26 +73,31 @@ def pupilize(im, threshold=127, invert=False,
     # return hough
 
 
-def pupil_trials(df, level=-1, bin_size=200, pre=-16000, post=21000):
+def pupil_trials(df, axis=1, level=-1, bin_size=200, pre=-16000, post=21000):
+
+    '''
+
+    '''
 
     pre_bins = pre / bin_size
     post_bins = post / bin_size
+    column_names = df.columns.names
 
     # Find unique animals from certain pattern in experiment names
     # subjects = np.unique([x.split('_')[0] for x in df.columns.levels[0]])
 
-    exps = df.xs('trials', axis=1, level=-1).columns
+    exps = df.xs('trials', axis=axis, level=level).columns
     exps_dict = {}
 
     # Iterate over experiments (different planes are separate experiments)
     for exp in exps:
         epochs_dict = {}
-        
+
         # Iterate over epochs
         for epoch in df[exp].index.levels[0]:
             df_epoch = df.loc[epoch, exp]
             trial_starts = df_epoch[df_epoch['trials'] == 1].index
-            trial_window = zip(trial_starts + pre, trial_loc + post - bin_size)
+            trial_window = zip(trial_starts + pre, trial_starts + post - bin_size)
             trials_dict = {}      # Initialize list of dataframes for each trial
 
             # Iterate over trials
@@ -111,6 +116,7 @@ def pupil_trials(df, level=-1, bin_size=200, pre=-16000, post=21000):
 
                 # Add and set new index
                 trial = pd.concat([trial, trial_index], axis=1)
+                trial.columns.names = [column_names[-1]]
                 trial = trial.reset_index(level='time')
                 trial = trial.set_index('trial_time')
                 trials_dict[n] = trial
@@ -121,8 +127,8 @@ def pupil_trials(df, level=-1, bin_size=200, pre=-16000, post=21000):
         epochs_df = pd.concat(epochs_dict, names=['epoch'], axis=0)
         exps_dict[exp] = epochs_df
         
-    exps_df = pd.concat(exps_dict, names=exps.names, axis=1)
-    exps_df = exps_df.sort_index(axis=1)  # Allows for indexing (killed myself over this)
+    exps_df = pd.concat(exps_dict, names=exps.names, axis=axis)
+    exps_df = exps_df.sort_index(axis=axis)  # Allows for indexing (killed myself over this)
 
     return exps_df
 
@@ -187,7 +193,8 @@ def manage_data(data, n_cores=1, threshold=127, sample_period=200, key='cam/fram
             behav['track'][1], behav['track'][0], ts_new, method=np.sum)
 
     # Save data
-    col_name = (animal_id, exp_day, plane)
+    col_name = (animal_id, plane)
+    # pdb.set_trace()
     df.set_value(epoch_dict[epoch], col_name + ('pupil', ), pupil_resampled)
     df.set_value(epoch_dict[epoch], col_name + ('trials', ), trials)
     df.set_value(epoch_dict[epoch], col_name + ('rail_home', ), rail_home)
@@ -239,6 +246,10 @@ def main():
         help="Output HDF5 file for data"
     )
     opts = parser.parse_args()
+    if opts.number_of_cores:
+        n_cores = int(opts.number_of_cores)
+    else:
+        n_cores = None
     thresh = int(opts.threshold)
 
     # Create DataFrame
@@ -254,9 +265,9 @@ def main():
             names=['epoch', 'time']
         ),
         columns=pd.MultiIndex(
-            levels=[[], [], [], []],
-            labels=[[], [], [], []],
-            names=['subject', 'experiment', 'plane', 'feature']
+            levels=[[], [], []],
+            labels=[[], [], []],
+            names=['subject', 'plane', 'feature']
         )
     )
 
@@ -266,12 +277,12 @@ def main():
 
         # pupils = np.column_stack([manage_data(f, mpool=p, df=df) for f in files])
 
-        pfn = partial(manage_data, n_cores=int(opts.number_of_cores), threshold=thresh, key=opts.key)
+        pfn = partial(manage_data, n_cores=n_cores, threshold=thresh, key=opts.key)
         map(pfn, files)
     elif os.path.isfile(opts.data):
-        manage_data(data, n_cores=int(opts.number_of_cores), threshold=thresh, key=opts.key)
+        manage_data(opts.data, n_cores=n_cores, threshold=thresh, key=opts.key)
     else:
-        raise IOError("Invalid input for data")
+        raise IOError("Invalid input '{}'".format(opts.data))
 
     # Save DataFrame
     # np.savetxt("pupils.txt", pupils)
@@ -282,9 +293,9 @@ def main():
 
     df = df.sort_index(axis=1)
     with pd.HDFStore(outfile) as hf:
-    	hf['pupils'] = df
-        hf.get_storer('pupils').attrs['threshold'] = thresh
-        hf.get_storer('pupils').attrs['timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    	hf['behav'] = df
+        hf.get_storer('behav').attrs['threshold'] = thresh
+        hf.get_storer('behav').attrs['timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     print("All done")
 
