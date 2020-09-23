@@ -1,1 +1,1 @@
-from .pupilize import *
+from pupilize import *
