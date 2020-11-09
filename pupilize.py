@@ -96,3 +96,6 @@ def circle2roi(circles):
     bl = [x - r, y + r]
 
     return np.array([tl, tr, br, bl, tl])
+
+def contour2roi(contour):
+    return np.concatenate([np.squeeze(contour), contour[0]], axis=0)
